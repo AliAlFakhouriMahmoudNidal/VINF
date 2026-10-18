@@ -1,16 +1,19 @@
-import ctypes
+# Crawling, parsing, storage and shared timing
 import json
-import os
 import re
-import shutil
-import sys
 import time
 from html import unescape
 from pathlib import Path
-from posixpath import normpath
 from urllib.error import HTTPError
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
+
+# Terminal UI
+import ctypes
+import os
+import shutil
+import sys
+from textwrap import wrap
 
 
 USER_AGENT = "VINFStudentPlantScraper/1.0"
@@ -22,6 +25,7 @@ DELAY = 0.1
 
 class Scraper:
     def __init__(self, data_dir=DATA_DIR):
+        self.run_started = time.perf_counter()
         self.data_dir = Path(data_dir)
         self.progress_dir = self.data_dir / "progress"
         self.html_dir = self.data_dir / "html"
@@ -41,12 +45,13 @@ class Scraper:
             "active_seconds": 0.0,
             "skipped_urls": 0,
             "retries": 0,
+            "error_counts": {},
         }
         self.current_url = "-"
         self.last_saved_url = "-"
         self.last_error = "-"
         self.status = "Starting"
-        self.active_started = time.perf_counter()
+        self.active_started = self.run_started
         self.screen_started = False
         self.use_ansi = sys.stdout.isatty()
 
@@ -64,6 +69,11 @@ class Scraper:
         self.progress_dir.mkdir(parents=True, exist_ok=True)
         self.html_dir.mkdir(parents=True, exist_ok=True)
         self.load_progress()
+        # Saved totals belong to earlier runs, not this run's throughput.
+        self.initial_stats = {
+            key: value for key, value in self.stats.items() if key != "error_counts"
+        }
+        self.initial_error_count = sum(self.stats["error_counts"].values())
 
     def download(self, url):
         for retry in range(5):
@@ -80,25 +90,32 @@ class Scraper:
                 error.close()
                 reason = f"HTTP {error.code}"
                 self.last_error = reason
-                if error.code == 404:
-                    self.status = "HTTP 404: skipping page"
+                self.record_error(reason)
+                if error.code in [404, 403]:
+                    self.status = f"HTTP {error.code}: skipping page"
                     self.output_interface()
                     return None
 
             except Exception as error:
                 reason = str(error)
                 self.last_error = reason
+                self.record_error(type(error).__name__)
 
             if retry < 4:
                 self.stats["retries"] += 1
-                self.status = f"{reason}. Attempt {retry + 2}/5 in 5 seconds"
+                self.status = f"{reason} on attempt {retry + 1}"
                 self.output_interface()
-                time.sleep(5)
+                time.sleep(5 * retry)
             else:
                 self.status = f"{reason}. Failed after 5 attempts"
                 self.output_interface()
 
         return None
+
+    def record_error(self, kind):
+        # Count every failed attempt, including 404s and the final attempt.
+        counts = self.stats["error_counts"]
+        counts[kind] = counts.get(kind, 0) + 1
 
     def filter_url(self, url):
         # Only allow HTTPS URLs on the RHS domain.
@@ -107,6 +124,11 @@ class Scraper:
 
         # Skip the shop and all pages inside it.
         if re.match(r"^https://www\.rhs\.org\.uk/shop([/?#]|$)", url):
+            return None
+
+        # Exclude the requested robots.txt paths, even with queries or fragments.
+        path = url[len(DOMAIN):].split("#", 1)[0].split("?", 1)[0]
+        if path.startswith("/api/") or path.endswith((".doc", ".docx", "undefined", "thank-you")):
             return None
 
         # Match plant pages: /plants/<number>/<name>/details.
@@ -118,28 +140,20 @@ class Scraper:
     def extract_links(self, html, page_url=BASE_URL):
         html = html.decode("utf-8", errors="replace")
 
-        # Find href values in single or double quotes.
-        links = re.findall(r"""\bhref\s*=\s*["']([^"']+)["']""", html, re.IGNORECASE)
+        # Match the closing quote to the opening quote, allowing the other inside.
+        links = re.finditer(r"""\bhref\s*=\s*(["'])(.*?)\1""", html, re.IGNORECASE | re.DOTALL)
 
         result = set()
-        for link in links:
-            link = unescape(link).strip()
+        for match in links:
+            # <a href="/plants?page=2&amp;sort=name"> -> <a href="/plants?page=2&amp;sort=name">
+            link = unescape(match.group(2)).strip()
+            if not link:
+                continue
 
-            if link.startswith("//"):
-                link = "https:" + link
-            elif link.startswith("/"):
-                link = DOMAIN + link
-            elif link.startswith("?"):
-                link = page_url.split("?", 1)[0] + link
-            elif link.startswith("#"):
-                link = page_url + link
-            # Links with a scheme, such as https: or mailto:, are already absolute.
-            elif not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", link):
-                directory = page_url[len(DOMAIN):].split("?", 1)[0].rsplit("/", 1)[0]
-                path, separator, query = link.partition("?")
-                link = DOMAIN + normpath(directory + "/" + path) + separator + query
-
-            result.add(link)
+            try:
+                result.add(urljoin(page_url, link))
+            except ValueError:
+                continue
 
         return result
 
@@ -186,36 +200,68 @@ class Scraper:
         yellow = "\033[93m" if self.use_ansi else ""
         red = "\033[91m" if self.use_ansi else ""
         reset = "\033[0m" if self.use_ansi else ""
-        download_rate = self.stats["downloaded_tokens"] / max(self.stats["download_seconds"], 0.001)
-        parse_rate = self.stats["parsed_tokens"] / max(self.stats["parse_seconds"], 0.001)
-        seconds = int(self.stats["active_seconds"] + time.perf_counter() - self.active_started)
-        active_time = f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+        now = time.perf_counter()
+        run_seconds = max(now - self.run_started, 0.0)
+        total_seconds = max(self.stats["active_seconds"] + now - self.active_started, 0.0)
+        run_stats = {
+            key: self.stats[key] - value for key, value in self.initial_stats.items()
+        }
+        error_counts = self.stats["error_counts"]
+        total_errors = sum(error_counts.values())
         border = cyan + "+" + "-" * (width - 2) + "+" + reset
 
         def row(text, colour=""):
-            text = " ".join(text.split())
+            text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
             if len(text) > width - 4:
                 text = text[:width - 7] + "..."
             return f"| {colour}{text:<{width - 4}}{reset} |"
 
+        def wrapped_rows(text, colour=""):
+            return [row(line, colour) for line in wrap(text, width - 4)]
+
+        def metric(label, total, current, colour=""):
+            if width < 70:
+                return [row(label, colour), *wrapped_rows(f"All runs: {total} | This run: {current}")]
+            value_width = (width - 28) // 2
+            return [row(f"{label:<24}{total:>{value_width}}{current:>{value_width}}", colour)]
+
+        def duration(seconds):
+            seconds = int(seconds)
+            return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+
+        def rate(count, seconds, per=1):
+            return f"{count * per / seconds:,.1f}" if seconds > 0 else "-"
+
         lines = [
             border,
-            row("RHS PLANT CRAWLER | V2 totals across restarts", cyan),
+            row("RHS PLANT CRAWLER | V2", cyan),
+            row(f"URLs queued: {len(self.queue):,}     Visited: {len(self.visited):,}", yellow),
             border,
-            row(f"Queue: {len(self.queue):,}     Visited: {len(self.visited):,}", yellow),
-            row(f"URLs downloaded: {self.stats['downloaded_urls']:,}     Skipped: {self.stats['skipped_urls']:,}"),
-            row(f"Plant pages saved: {self.stats['saved_pages']:,}     Retries: {self.stats['retries']:,}", green),
-            row(f"Downloaded MB: {self.stats['downloaded_bytes'] / 1_000_000:.2f}     Plant pages saved MB: {self.stats['saved_bytes'] / 1_000_000:.2f}"),
-            row(f"Tokens downloaded: {self.stats['downloaded_tokens']:,}     Parsed: {self.stats['parsed_tokens']:,}"),
-            row(f"Average tokens/s - download: {download_rate:,.0f}     parse: {parse_rate:,.0f}"),
-            row(f"Active time: {active_time} (paused time excluded)"),
+            *(metric("", "ALL RUNS", "THIS RUN", cyan) if width >= 70 else []),
+            *metric("Runtime", duration(total_seconds), duration(run_seconds)),
+            *metric("Tokens parsed", f"{self.stats['parsed_tokens']:,}", f"{run_stats['parsed_tokens']:,}", green),
+            *metric("Average tokens/s", rate(self.stats['parsed_tokens'], total_seconds), rate(run_stats['parsed_tokens'], run_seconds)),
+            *metric("Pages downloaded", f"{self.stats['downloaded_urls']:,}", f"{run_stats['downloaded_urls']:,}"),
+            *metric("Average pages/min", rate(self.stats['downloaded_urls'], total_seconds, 60), rate(run_stats['downloaded_urls'], run_seconds, 60)),
+            *metric("Plant pages saved", f"{self.stats['saved_pages']:,}", f"{run_stats['saved_pages']:,}", green),
+            *metric("URLs skipped (failed)", f"{self.stats['skipped_urls']:,}", f"{run_stats['skipped_urls']:,}"),
+            *metric("HTML downloaded (MB)", f"{self.stats['downloaded_bytes'] / 1_000_000:,.2f}", f"{run_stats['downloaded_bytes'] / 1_000_000:,.2f}"),
+            *metric("Plant HTML saved (MB)", f"{self.stats['saved_bytes'] / 1_000_000:,.2f}", f"{run_stats['saved_bytes'] / 1_000_000:,.2f}"),
+            *metric("Failed attempts", f"{total_errors:,}", f"{total_errors - self.initial_error_count:,}", red if total_errors else ""),
+            *wrapped_rows(
+                "Errors by type (since tracking began): " + (
+                    " | ".join(f"{kind}: {count:,}" for kind, count in sorted(error_counts.items(), key=lambda item: (-item[1], item[0])))
+                    or "none"
+                ),
+                red if total_errors else "",
+            ),
             border,
             row(f"Current URL: {self.current_url}", yellow),
             row(f"Last saved:  {self.last_saved_url}", green),
             row(f"Status: {self.status}", green if self.status == "Finished" else yellow),
             row(f"Last error: {self.last_error}", red if self.last_error != "-" else ""),
             border,
-            row("Tokens = whitespace-separated HTML pieces. Ctrl+C saves and stops."),
+            *wrapped_rows("Ctrl+C saves and stops."),
             border,
         ]
 
