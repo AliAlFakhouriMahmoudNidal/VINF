@@ -32,6 +32,8 @@ FIELD_WEIGHTS = {
 }
 TEXT_FIELDS = {"primary_name", "alternative_names", "description"}
 DESCRIPTION_BONUS = 2
+BM25_K1 = 1.2
+BM25_B = 0.75
 
 
 def tokenize(text):
@@ -43,8 +45,11 @@ def log_tf(tf):
 
 
 def idf(df, total, method):
-    if method == "smooth":
-        return math.log((total + 1) / (df + 1)) + 1
+    if method == "bm25":
+        # Strictly positive IDF, including words in over half the plants.
+        return math.log1p((total - df + 0.5) / (df + 0.5))
+    if method != "classic":
+        raise ValueError(f"Unknown scoring method: {method}")
     return math.log(total / df)
 
 
@@ -52,6 +57,20 @@ def build_index(source=SOURCE):
     started = perf_counter()
     index = {}
     documents = {}
+    # First pass: average length of each field for BM25F normalization.
+    field_lengths = dict.fromkeys(FIELD_WEIGHTS, 0)
+    total = 0
+    with source.open(encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream, delimiter="\t", quoting=csv.QUOTE_NONE)
+        for row in reader:
+            total += 1
+            for field in FIELD_WEIGHTS:
+                tokens = tokenize(row[field])
+                length = len(tokens) if field in TEXT_FIELDS else len(set(tokens))
+                field_lengths[field] += length
+    averages = {field: length / total if total else 0
+                for field, length in field_lengths.items()}
+
     with source.open(encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream, delimiter="\t", quoting=csv.QUOTE_NONE)
         for row in reader:
@@ -59,15 +78,20 @@ def build_index(source=SOURCE):
             term_weights = {}
             for field, weight in FIELD_WEIGHTS.items():
                 counts = Counter(tokenize(row[field]))
+                length = sum(counts.values()) if field in TEXT_FIELDS else len(counts)
+                norm = 1 - BM25_B + BM25_B * length / averages[field] if averages[field] else 1
                 for term, count in counts.items():
                     # Repeated words matter in text, but only presence matters
                     # in categorical fields such as moisture and soil types.
                     tf = log_tf(count) if field in TEXT_FIELDS else 1
-                    term_weights[term] = term_weights.get(term, 0) + weight * tf
-            for term, weight in term_weights.items():
-                index.setdefault(term, []).append((doc_id, weight))
+                    raw_tf = count if field in TEXT_FIELDS else 1
+                    weights = term_weights.setdefault(term, [0, 0])
+                    weights[0] += weight * tf
+                    weights[1] += weight * raw_tf / norm
+            for term, (classic_weight, bm25_tf) in term_weights.items():
+                index.setdefault(term, []).append((doc_id, classic_weight, bm25_tf))
             documents[doc_id] = row
-            if len(documents) % 50000 == 0:
+            if len(documents) % 2000 == 0:
                 print(f"Plants processed: {len(documents):,}", flush=True)
 
     print(f"Documents: {len(documents):,}")
@@ -89,12 +113,15 @@ def search(query, index, documents, method="classic", limit=10, mode="or"):
                 return []
             continue
         if mode == "and":
-            matching = {doc_id for doc_id, _ in postings}
+            matching = {doc_id for doc_id, _, _ in postings}
             candidates = matching if candidates is None else candidates & matching
             if not candidates:
                 return []
         word_idf = idf(len(postings), len(documents), method)
-        for doc_id, weight in postings:
+        for doc_id, classic_weight, bm25_tf in postings:
+            # BM25F combines normalized field frequencies before saturation.
+            weight = (bm25_tf * (BM25_K1 + 1) / (bm25_tf + BM25_K1)
+                      if method == "bm25" else classic_weight)
             scores[doc_id] = scores.get(doc_id, 0) + weight * word_idf
     if mode == "and":
         scores = {doc_id: score for doc_id, score in scores.items() if doc_id in candidates}
@@ -138,12 +165,12 @@ def result_text(rank, doc_id, score, documents, show_details, query=""):
     return body
 
 
-def print_results(classic_results, smooth_results, documents, show_details=False, query=""):
+def print_results(classic_results, bm25_results, documents, show_details=False, query=""):
     table = Table(expand=True, show_lines=True, border_style="cyan", header_style="bold cyan")
     table.add_column("Classic IDF", ratio=1)
-    table.add_column("Smooth IDF", ratio=1)
+    table.add_column("BM25 (BM25F)", ratio=1)
     columns = []
-    for results in (classic_results, smooth_results):
+    for results in (classic_results, bm25_results):
         cells = [result_text(rank, doc_id, score, documents, show_details, query)
                  for rank, (doc_id, score) in enumerate(results, 1)]
         columns.append(cells or [Text("No results.", style="yellow")])
@@ -189,8 +216,8 @@ def main():
             console.print(f"Limit: {limit}")
             continue
         classic_results = search(query, index, documents, "classic", limit=limit, mode=mode)
-        smooth_results = search(query, index, documents, "smooth", limit=limit, mode=mode)
-        print_results(classic_results, smooth_results, documents, show_details, query)
+        bm25_results = search(query, index, documents, "bm25", limit=limit, mode=mode)
+        print_results(classic_results, bm25_results, documents, show_details, query)
 
 
 if __name__ == "__main__":
