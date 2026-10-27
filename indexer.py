@@ -325,9 +325,9 @@ def main():
             continue
         print_results(classic_results, bm25_results, documents, show_details, query)
         console.print(
-            f"[bold cyan]Search time:[/bold cyan] {(finished - started) * 1000:.2f} ms total"
-            f"  [dim](Classic: {(classic_finished - started) * 1000:.2f} ms"
-            f" | BM25F: {(finished - classic_finished) * 1000:.2f} ms)[/dim]"
+            f"[bold cyan]Search time:[/bold cyan] {(finished - started) * 1000:.3f} ms total"
+            f"  [dim](Classic: {(classic_finished - started) * 1000:.3f} ms"
+            f" | BM25F: {(finished - classic_finished) * 1000:.3f} ms)[/dim]"
         )
 
 
