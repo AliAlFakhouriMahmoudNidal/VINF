@@ -1,5 +1,3 @@
-"""Build an in-memory index and search it with: python indexer.py."""
-
 import csv
 import math
 import re
@@ -15,7 +13,7 @@ from rich.text import Text
 
 
 BASE_DIR = Path(__file__).resolve().parent
-SOURCE = BASE_DIR / "plants-extracted.tsv"
+SOURCE = BASE_DIR / "data" / "plants-extracted.tsv"
 NAME_FIELDS = ("primary_name", "alternative_names")
 NAME_WEIGHT = 3
 DESCRIPTION_BONUS = 2

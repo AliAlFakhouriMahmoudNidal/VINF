@@ -1,4 +1,3 @@
-# Crawling, parsing, storage and shared timing
 import json
 import re
 import time

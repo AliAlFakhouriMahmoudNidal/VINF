@@ -1,8 +1,3 @@
-"""Extract saved RHS plant pages with: python extract_tsv.py.
-
-Edit the settings at the start of main() to choose files and output.
-"""
-
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -25,9 +20,7 @@ LABELS = {
 }
 FLAGS = re.IGNORECASE | re.DOTALL
 
-# Regex finds the fields. json.loads below only decodes individual quoted strings
-# (for example, \u00d7 or an escaped quotation mark), not the metadata document.
-# A quoted string can contain escaped characters, including an escaped quote.
+
 JSON_STRING = r'"(?:\\.|[^"\\])*"'
 QUOTED_STRING = re.compile(JSON_STRING)
 METADATA = re.compile(
@@ -39,12 +32,14 @@ ALIASES = re.compile(rf'''
     ( {JSON_STRING} (?: \s*,\s* {JSON_STRING} )* )?
     \s* \]
 ''', re.VERBOSE)
+
 # One match returns both the rank and name, whichever property comes first.
 TAXONOMY = re.compile(rf'''
-    \{{                                              # Start of an object
-    (?=[^{{}}]*"taxonRank"\s*:\s*"(genus|family)")    # Capture its rank
-    [^{{}}]*?"name"\s*:\s*({JSON_STRING})             # Capture its name
+    \{{
+    (?=[^{{}}]*"taxonRank"\s*:\s*"(genus|family)")
+    [^{{}}]*?"name"\s*:\s*({JSON_STRING})
 ''', re.VERBOSE)
+
 # Match a canonical link and capture its URL. Attribute order does not matter.
 CANONICAL = re.compile(r'''
     <link\b
@@ -63,6 +58,7 @@ NAME_PARAGRAPHS = re.compile(
     r'''<p\b[^>]*\bclass=["']plant-profile__(?:names|synonyms)-text["'][^>]*>'''
     r'(.*?)</p>', FLAGS,
 )
+
 # Description paragraphs have no class attribute.
 DESCRIPTION = re.compile(r"<p\b(?![^>]*\bclass\s*=)[^>]*>(.*?)</p>", FLAGS)
 CARDS_START = re.compile(r'''<div\b[^>]*\bclass=["']cards["'][^>]*>''', FLAGS)
@@ -236,7 +232,7 @@ def read_plants(files, readers):
 
 def main():
     input_dir = Path("data/html")
-    output = Path("data/plants.tsv")
+    output = Path("data/plants-extracted.tsv")
     readers = 1
     limit = None
 
