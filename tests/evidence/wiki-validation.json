@@ -1,6 +1,0 @@
-{
-  "records": 91004,
-  "parquet_tsv_identical": true,
-  "one_row_per_id": true,
-  "maximum_description_characters": 17737
-}

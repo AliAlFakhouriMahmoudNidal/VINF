@@ -10,7 +10,7 @@ spark/data/
 /data/output/*
 !/data/output/plants-extracted.tsv
 lucene/data/
-tests/data/
+/tests/
 data/wiki-selected/
 data/plants-enriched-selected/
 data/rhs-spark*/
