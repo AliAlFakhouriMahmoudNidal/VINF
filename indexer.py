@@ -13,7 +13,7 @@ from rich.text import Text
 
 
 BASE_DIR = Path(__file__).resolve().parent
-SOURCE = BASE_DIR / "data" / "plants-extracted.tsv"
+SOURCE = BASE_DIR / "data" / "output" / "plants-extracted.tsv"
 # Relative field weights. Restart the indexer after changing these values.
 FIELD_WEIGHTS = {
     "primary_name": 4,

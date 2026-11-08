@@ -18,7 +18,7 @@ from textwrap import wrap
 USER_AGENT = "VINFStudentPlantScraper/1.0"
 DOMAIN = "https://www.rhs.org.uk"
 BASE_URL = DOMAIN + "/plants"
-DATA_DIR = Path("data")
+DATA_DIR = Path("data/input")
 DELAY = 0.1
 
 

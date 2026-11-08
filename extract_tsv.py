@@ -231,8 +231,8 @@ def read_plants(files, readers):
 
 
 def main():
-    input_dir = Path("data/html")
-    output = Path("data/plants-extracted.tsv")
+    input_dir = Path("data/input/html")
+    output = Path("data/output/plants-extracted.tsv")
     readers = 1
     limit = None
 

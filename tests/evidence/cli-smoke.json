@@ -1,0 +1,20 @@
+{
+  "checked_local_date": "2026-11-07",
+  "timezone": "Europe/Bratislava",
+  "launcher": "lucene.ps1",
+  "index": "data/lucene-index",
+  "one_shot_queries": [
+    {"query": "primary_name:(abies AND alba)", "total_hits": 19, "first_id": 11},
+    {"query": "description:\"red flowers\"", "total_hits": 2018, "first_id": 269363},
+    {"query": "canonical_id:[10 TO 20]", "total_hits": 7}
+  ],
+  "interactive_terminal": {
+    "launcher_started": true,
+    "limit_command": 2,
+    "query": "match_status:matched AND wiki_habitat:forest",
+    "total_hits": 1294,
+    "shown_ids": [63239, 221175],
+    "blank_input_exits": true,
+    "exit_code": 0
+  }
+}

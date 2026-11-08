@@ -1,0 +1,36 @@
+FROM ubuntu:24.04 AS build
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl make g++ openjdk-21-jdk-headless python3-dev python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+ENV JCC_JDK=${JAVA_HOME}
+ENV JCC_LFLAGS="-L${JAVA_HOME}/lib:-ljava:-L${JAVA_HOME}/lib/server:-ljvm:-Wl,-rpath=${JAVA_HOME}/lib:-Wl,-rpath=${JAVA_HOME}/lib/server"
+ENV PATH=/opt/venv/bin:${PATH}
+RUN python3 -m venv /opt/venv \
+    && pip install --no-cache-dir setuptools==75.1.0 build==1.2.2 wheel==0.44.0 rich==14.2.0
+WORKDIR /build
+RUN curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 \
+    https://dlcdn.apache.org/lucene/pylucene/pylucene-10.0.0-src.tar.gz -o pylucene-10.0.0-src.tar.gz \
+    && echo '100c3d61d6799ac16b7b8c1826cddf07fb1715141ebdb0d7b8119cdd96b24574  pylucene-10.0.0-src.tar.gz' | sha256sum -c - \
+    && tar -xzf pylucene-10.0.0-src.tar.gz
+WORKDIR /build/pylucene-10.0.0/jcc
+RUN python setup.py build && python setup.py install
+WORKDIR /build/pylucene-10.0.0
+RUN make lucene
+RUN make compile install PYTHON=/opt/venv/bin/python \
+    JCC='/opt/venv/bin/python -m jcc --shared' NUM_FILES=16 MODERN_PACKAGING=true
+RUN python -c "import lucene; lucene.initVM(); print('PyLucene', lucene.VERSION)"
+
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-21-jre-headless python3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /opt/venv /opt/venv
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+ENV PATH=/opt/venv/bin:${PATH}
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+WORKDIR /app
+ENTRYPOINT ["python"]
+CMD ["lucene/lucene_index.py", "interactive"]
