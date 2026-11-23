@@ -85,15 +85,14 @@ def clean_text(text):
     return " ".join(text.split())
 
 
-def unique(values):
-    result = []
-    seen = set()
+def unique(values, exclude=""):
+    by_name = {}
+    excluded = exclude.casefold()
     for value in values:
         key = value.casefold()
-        if value and key not in seen:
-            result.append(value)
-            seen.add(key)
-    return result
+        if value and key != excluded:
+            by_name.setdefault(key, value)
+    return list(by_name.values())
 
 
 def split_values(text):
@@ -103,12 +102,6 @@ def split_values(text):
 
 
 def extract_plant(html):
-    record = {}
-    for field in COLUMNS:
-        if field in LIST_FIELDS:
-            record[field] = []
-        else:
-            record[field] = ""
     canonical = CANONICAL.search(html)
     url = unescape(canonical.group(1)).strip() if canonical else ""
     plant_id = PLANT_URL.fullmatch(url)
@@ -118,52 +111,47 @@ def extract_plant(html):
     if not plant_id or not main or not heading:
         raise ValueError("Missing RHS canonical plant URL, plant section, or heading")
 
+    profile = main.group(1)
+    record = {field: [] if field in LIST_FIELDS else "" for field in COLUMNS}
     record["canonical_id"] = plant_id.group(1)
     record["source_url"] = url.rstrip("/")
     record["primary_name"] = clean_text(heading.group(1))
     if not record["primary_name"]:
         raise ValueError("Empty plant name")
 
+    names = record["alternative_names"]
     for script in METADATA.findall(html):
         aliases = ALIASES.search(script)
         if aliases:
             for value in QUOTED_STRING.findall(aliases.group(1) or ""):
-                name = clean_text(json.loads(value))
-                record["alternative_names"].append(name)
+                names.append(clean_text(json.loads(value)))
         for field, name in TAXONOMY.findall(script):
             if not record[field]:
                 record[field] = clean_text(json.loads(name))
 
     # These visible names also cover pages without an alternateName array.
-    if not record["alternative_names"]:
+    if not names:
         title = TITLE.search(body)
         if title:
             title_text = clean_text(title.group(1))
             if "|" in title_text:
-                name = title_text.rsplit("|", 1)[1].strip()
-                record["alternative_names"].append(name)
-        for paragraph in NAME_PARAGRAPHS.findall(main.group(1)):
-            record["alternative_names"].extend(part.strip() for part in clean_text(paragraph).split(","))
-    record["alternative_names"] = unique(
-        name for name in record["alternative_names"]
-        if name.casefold() != record["primary_name"].casefold()
-    )
+                names.append(title_text.rsplit("|", 1)[1].strip())
+        for paragraph in NAME_PARAGRAPHS.findall(profile):
+            names.extend(part.strip() for part in clean_text(paragraph).split(","))
+    record["alternative_names"] = unique(names, exclude=record["primary_name"])
 
     # RHS puts its description after the names/types and before the summary cards.
     # Name paragraphs have classes; the description paragraph does not.
-    before_cards = CARDS_START.split(main.group(1), maxsplit=1)[0]
+    before_cards = CARDS_START.split(profile, maxsplit=1)[0]
     for paragraph in DESCRIPTION.findall(before_cards):
         record["description"] = clean_text(paragraph)
 
-    record["plant_types"] = unique(clean_text(value) for value in TYPES.findall(main.group(1)))
+    record["plant_types"] = unique(clean_text(value) for value in TYPES.findall(profile))
     for label, value in DEFINITIONS.findall(body):
         field = LABELS.get(clean_text(label))
         if field:
-            if field in LIST_FIELDS:
-                record[field] = split_values(value)
-            else:
-                record[field] = clean_text(value)
-    for label, value in CARD_FIELDS.findall(main.group(1)):
+            record[field] = split_values(value) if field in LIST_FIELDS else clean_text(value)
+    for label, value in CARD_FIELDS.findall(profile):
         field = "position" if label.lower() == "position" else "soil_types"
         record[field] = split_values(value)
     return record
@@ -179,13 +167,17 @@ def merge_plant(plants, record, source_file):
     existing = plants[plant_id]
     names = existing["alternative_names"] + [existing["primary_name"]]
     names += record["alternative_names"] + [record["primary_name"]]
-    names = unique(names)
     for field in COLUMNS:
         if record[field] and (is_canonical or not existing[field]):
             existing[field] = record[field]
-    existing["alternative_names"] = [
-        name for name in names if name.casefold() != existing["primary_name"].casefold()
-    ]
+    existing["alternative_names"] = unique(names, exclude=existing["primary_name"])
+
+
+def tsv_cell(value):
+    if isinstance(value, list):
+        items = (" ".join(item.split()) for item in value)
+        return "|".join(item.replace("\\", "\\\\").replace("|", "\\|") for item in items)
+    return " ".join(str(value).split())
 
 
 def write_tsv(plants, output):
@@ -196,19 +188,7 @@ def write_tsv(plants, output):
             target.write("\t".join(COLUMNS) + "\n")
             for plant_id in sorted(plants, key=int):
                 record = plants[plant_id]
-                cells = []
-                for field in COLUMNS:
-                    value = record[field]
-                    if isinstance(value, list):
-                        items = []
-                        for item in value:
-                            item = " ".join(item.split())
-                            item = item.replace("\\", "\\\\").replace("|", "\\|")
-                            items.append(item)
-                        cell = "|".join(items)
-                    else:
-                        cell = " ".join(str(value).split())
-                    cells.append(cell)
+                cells = (tsv_cell(record[field]) for field in COLUMNS)
                 target.write("\t".join(cells) + "\n")
         temporary.replace(output)
     finally:

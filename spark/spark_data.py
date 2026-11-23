@@ -203,17 +203,8 @@ def tsv_escape(column):
 def tsv_unescape(value):
     if value in (None, ""):
         return None
-    result = []
-    index = 0
     escapes = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\"}
-    while index < len(value):
-        if value[index] == "\\" and index + 1 < len(value):
-            index += 1
-            result.append(escapes.get(value[index], "\\" + value[index]))
-        else:
-            result.append(value[index])
-        index += 1
-    return "".join(result)
+    return re.sub(r"\\([nrt\\])", lambda match: escapes[match[1]], value)
 
 
 def write_tsv(frame, output):

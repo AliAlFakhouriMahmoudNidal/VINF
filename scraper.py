@@ -1,6 +1,7 @@
 import json
 import re
 import time
+from contextlib import contextmanager
 from html import unescape
 from pathlib import Path
 from urllib.error import HTTPError
@@ -173,9 +174,10 @@ class Scraper:
 
     def load_progress(self):
         # Read the old layout too, so changing folders does not reset progress.
-        progress_file = self.progress_file
-        if not progress_file.exists():
-            progress_file = self.data_dir / "progress.json"
+        def saved_path(path):
+            return path if path.exists() else self.data_dir / path.name
+
+        progress_file = saved_path(self.progress_file)
         if progress_file.exists():
             progress = json.loads(progress_file.read_text(encoding="utf-8"))
             self.queue = set(progress["queue"])
@@ -184,9 +186,7 @@ class Scraper:
             self.last_saved_url = progress.get("last_saved_url", "-")
             self.last_error = progress.get("last_error", "-")
 
-        last_downloaded_file = self.last_downloaded_file
-        if not last_downloaded_file.exists():
-            last_downloaded_file = self.data_dir / "last_downloaded.txt"
+        last_downloaded_file = saved_path(self.last_downloaded_file)
         if self.last_saved_url == "-" and last_downloaded_file.exists():
             self.last_saved_url = last_downloaded_file.read_text(encoding="utf-8")
 
@@ -194,11 +194,10 @@ class Scraper:
 
     def output_interface(self):
         width = max(20, min(shutil.get_terminal_size((100, 25)).columns - 1, 110))
-        cyan = "\033[96m" if self.use_ansi else ""
-        green = "\033[92m" if self.use_ansi else ""
-        yellow = "\033[93m" if self.use_ansi else ""
-        red = "\033[91m" if self.use_ansi else ""
-        reset = "\033[0m" if self.use_ansi else ""
+        if self.use_ansi:
+            cyan, green, yellow, red, reset = "\033[96m", "\033[92m", "\033[93m", "\033[91m", "\033[0m"
+        else:
+            cyan = green = yellow = red = reset = ""
         now = time.perf_counter()
         run_seconds = max(now - self.run_started, 0.0)
         total_seconds = max(self.stats["active_seconds"] + now - self.active_started, 0.0)
@@ -224,36 +223,41 @@ class Scraper:
             value_width = (width - 28) // 2
             return [row(f"{label:<24}{total:>{value_width}}{current:>{value_width}}", colour)]
 
-        def duration(seconds):
-            seconds = int(seconds)
-            return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+        def summary(stats, seconds, failures):
+            def rate(key, per=1):
+                return f"{stats[key] * per / seconds:,.1f}" if seconds > 0 else "-"
 
-        def rate(count, seconds, per=1):
-            return f"{count * per / seconds:,.1f}" if seconds > 0 else "-"
+            elapsed = int(seconds)
+            return {
+                "Runtime": f"{elapsed // 3600:02d}:{elapsed // 60 % 60:02d}:{elapsed % 60:02d}",
+                "Tokens parsed": f"{stats['parsed_tokens']:,}",
+                "Average tokens/s": rate("parsed_tokens"),
+                "Pages downloaded": f"{stats['downloaded_urls']:,}",
+                "Average pages/min": rate("downloaded_urls", 60),
+                "Plant pages saved": f"{stats['saved_pages']:,}",
+                "URLs skipped (failed)": f"{stats['skipped_urls']:,}",
+                "HTML downloaded (MB)": f"{stats['downloaded_bytes'] / 1_000_000:,.2f}",
+                "Plant HTML saved (MB)": f"{stats['saved_bytes'] / 1_000_000:,.2f}",
+                "Failed attempts": f"{failures:,}",
+            }
 
         lines = [
             border,
             row("RHS PLANT CRAWLER | V2", cyan),
             row(f"URLs queued: {len(self.queue):,}     Visited: {len(self.visited):,}", yellow),
             border,
-            *(metric("", "ALL RUNS", "THIS RUN", cyan) if width >= 70 else []),
-            *metric("Runtime", duration(total_seconds), duration(run_seconds)),
-            *metric("Tokens parsed", f"{self.stats['parsed_tokens']:,}", f"{run_stats['parsed_tokens']:,}", green),
-            *metric("Average tokens/s", rate(self.stats['parsed_tokens'], total_seconds), rate(run_stats['parsed_tokens'], run_seconds)),
-            *metric("Pages downloaded", f"{self.stats['downloaded_urls']:,}", f"{run_stats['downloaded_urls']:,}"),
-            *metric("Average pages/min", rate(self.stats['downloaded_urls'], total_seconds, 60), rate(run_stats['downloaded_urls'], run_seconds, 60)),
-            *metric("Plant pages saved", f"{self.stats['saved_pages']:,}", f"{run_stats['saved_pages']:,}", green),
-            *metric("URLs skipped (failed)", f"{self.stats['skipped_urls']:,}", f"{run_stats['skipped_urls']:,}"),
-            *metric("HTML downloaded (MB)", f"{self.stats['downloaded_bytes'] / 1_000_000:,.2f}", f"{run_stats['downloaded_bytes'] / 1_000_000:,.2f}"),
-            *metric("Plant HTML saved (MB)", f"{self.stats['saved_bytes'] / 1_000_000:,.2f}", f"{run_stats['saved_bytes'] / 1_000_000:,.2f}"),
-            *metric("Failed attempts", f"{total_errors:,}", f"{total_errors - self.initial_error_count:,}", red if total_errors else ""),
-            *wrapped_rows(
-                "Errors by type (since tracking began): " + (
-                    " | ".join(f"{kind}: {count:,}" for kind, count in sorted(error_counts.items(), key=lambda item: (-item[1], item[0])))
-                    or "none"
-                ),
-                red if total_errors else "",
-            ),
+        ]
+        if width >= 70:
+            lines.extend(metric("", "ALL RUNS", "THIS RUN", cyan))
+        colours = {"Tokens parsed": green, "Plant pages saved": green, "Failed attempts": red if total_errors else ""}
+        current = summary(run_stats, run_seconds, total_errors - self.initial_error_count)
+        for label, total in summary(self.stats, total_seconds, total_errors).items():
+            lines.extend(metric(label, total, current[label], colours.get(label, "")))
+
+        by_frequency = sorted(error_counts.items(), key=lambda item: (-item[1], item[0]))
+        errors = " | ".join(f"{kind}: {count:,}" for kind, count in by_frequency) or "none"
+        lines += [
+            *wrapped_rows("Errors by type (since tracking began): " + errors, red if total_errors else ""),
             border,
             row(f"Current URL: {self.current_url}", yellow),
             row(f"Last saved:  {self.last_saved_url}", green),
@@ -272,6 +276,37 @@ class Scraper:
         else:
             print("\n".join(lines), flush=True)
 
+    @contextmanager
+    def track_time(self, key):
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.stats[key] += time.perf_counter() - started
+
+    def process_page(self, url, html):
+        tokens = len(html.split())
+        self.stats["downloaded_urls"] += 1
+        self.stats["downloaded_bytes"] += len(html)
+        self.stats["downloaded_tokens"] += tokens
+
+        if self.filter_url(url):
+            plant_id = url.split("/")[4]
+            (self.html_dir / f"{plant_id}.html").write_bytes(html)
+            self.stats["saved_bytes"] += len(html)
+            self.last_downloaded_file.write_text(url, encoding="utf-8")
+            self.stats["saved_pages"] += 1
+            self.last_saved_url = url
+
+        self.status = "Parsing links"
+        self.output_interface()
+        with self.track_time("parse_seconds"):
+            for link in self.extract_links(html, url):
+                link = link.split("#", 1)[0]
+                if self.filter_url(link) is not None and link not in self.visited:
+                    self.queue.add(link)
+        self.stats["parsed_tokens"] += tokens
+
     def crawler(self):
         self.queue = {url for url in self.queue if self.filter_url(url) is not None}
         self.save_progress()
@@ -282,50 +317,19 @@ class Scraper:
                 self.current_url = url
                 self.status = "Downloading"
                 self.output_interface()
-                started = time.perf_counter()
-                try:
+                with self.track_time("download_seconds"):
                     html = self.download(url)
-                finally:
-                    self.stats["download_seconds"] += time.perf_counter() - started
 
-                # Mark failed URLs as visited and continue.
                 if html is None:
                     self.status = f"Skipped: {self.last_error}"
                     self.stats["skipped_urls"] += 1
-                    self.queue.remove(url)
-                    self.visited.add(url)
-                    self.save_progress()
-                    self.output_interface()
-                    continue
-
-                tokens = len(html.split())
-                self.stats["downloaded_urls"] += 1
-                self.stats["downloaded_bytes"] += len(html)
-                self.stats["downloaded_tokens"] += tokens
-
-                if self.filter_url(url):
-                    plant_id = url.split("/")[4]
-                    (self.html_dir / f"{plant_id}.html").write_bytes(html)
-                    self.stats["saved_bytes"] += len(html)
-                    self.last_downloaded_file.write_text(url, encoding="utf-8")
-                    self.stats["saved_pages"] += 1
-                    self.last_saved_url = url
-
-                self.status = "Parsing links"
-                self.output_interface()
-                started = time.perf_counter()
-                try:
-                    for link in self.extract_links(html, url):
-                        link = link.split("#", 1)[0]
-                        if self.filter_url(link) is not None and link not in self.visited:
-                            self.queue.add(link)
-                finally:
-                    self.stats["parse_seconds"] += time.perf_counter() - started
-
-                self.stats["parsed_tokens"] += tokens
+                else:
+                    self.process_page(url, html)
                 self.queue.remove(url)
                 self.visited.add(url)
                 self.save_progress()
+                if html is None:
+                    self.output_interface()
 
             self.current_url = "-"
             self.status = "Finished"

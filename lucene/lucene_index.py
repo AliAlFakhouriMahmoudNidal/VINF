@@ -60,44 +60,44 @@ def read_records(source):
     csv.field_size_limit(2**31 - 1)
     if source.is_dir():
         root = source.parent if source.name == "tsv" else source
-        if not (root / "tsv/_SUCCESS").is_file():
+        partitions = root / "tsv"
+        if not (partitions / "_SUCCESS").is_file():
             raise ValueError(f"Spark TSV export is not complete: {root}")
         schema = json.loads((root / "schema.json").read_text(encoding="utf-8"))
-        types = {field["name"]: field["type"] for field in schema["fields"]}
-        paths = sorted((root / "tsv").glob("part-*.csv"))
+        decode_json = {field["name"]: isinstance(field["type"], dict) for field in schema["fields"]}
+        paths = sorted(partitions.glob("part-*.csv"))
         if not paths:
-            raise ValueError(f"No TSV partitions in {root / 'tsv'}")
+            raise ValueError(f"No TSV partitions in {partitions}")
     else:
-        paths, types = [source], None
+        paths, decode_json = [source], None
     escapes = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\"}
+    unescape = re.compile(r"\\([nrt\\])").sub
     for path in paths:
         with path.open(encoding="utf-8", newline="") as stream:
             reader = csv.DictReader(stream, delimiter="\t", quoting=csv.QUOTE_NONE)
-            current_format = "names" in (reader.fieldnames or ())
+            columns = tuple(reader.fieldnames or ())
+            current_format = "names" in columns
             if current_format:
-                if tuple(reader.fieldnames) != ENRICHED_COLUMNS:
+                if columns != ENRICHED_COLUMNS:
                     raise ValueError("Enriched TSV must have the current 26 columns in order")
-                types = {key: {} if key in JSON_FIELDS else "string" for key in reader.fieldnames}
-            elif types is None and {"candidate_page_ids", "match_evidence"} <= set(reader.fieldnames or ()):
+                decode_json = {key: key in JSON_FIELDS for key in columns}
+            elif decode_json is None and "candidate_page_ids" in columns and "match_evidence" in columns:
                 json_fields = {"candidate_page_ids", "match_evidence", "wiki_scientific_synonyms",
                                "wiki_common_names", "wiki_redirect_aliases"}
-                types = {key: {} if key in json_fields else "string" for key in reader.fieldnames}
+                decode_json = {key: key in json_fields for key in columns}
+            null_values = ("",) if current_format else (None, r"\N")
             for row in reader:
                 if current_format and (None in row or None in row.values()):
                     raise ValueError(f"Invalid TSV row at line {reader.line_num}")
                 row.pop("wiki_full_text", None)
                 row.pop("full_text", None)
-                if types is not None:
+                if decode_json is not None:
                     for key, value in row.items():
-                        if current_format:
-                            value = None if value == "" else re.sub(r"\\([nrt\\])", lambda match: escapes[match[1]], value)
-                        elif value in (None, r"\N") or (value == "" and key.startswith("wiki_")):
-                            value = None
+                        if value in null_values or (value == "" and key.startswith("wiki_")):
+                            row[key] = None
                         else:
-                            value = re.sub(r"\\([nrt\\])", lambda match: escapes[match[1]], value)
-                        if value is not None and isinstance(types[key], dict):
-                            value = json.loads(value)
-                        row[key] = value
+                            text = unescape(lambda match: escapes[match[1]], value)
+                            row[key] = json.loads(text) if decode_json[key] else text
                 yield row
 
 
@@ -126,10 +126,16 @@ def build_index(source=SOURCE, output=INDEX):
     matched = 0
     try:
         for row in read_records(source):
-            identifier = int(row["canonical_id"])
-            if identifier in seen:
-                raise ValueError(f"Duplicate canonical_id: {identifier}")
-            seen.add(identifier)
+            has_rhs = row.get("canonical_id") not in (None, "")
+            has_wiki = row.get("wiki_page_id") not in (None, "")
+            id_field = "canonical_id" if has_rhs else "wiki_page_id"
+            if not (has_rhs or has_wiki):
+                raise ValueError("Plant record needs a canonical_id or wiki_page_id")
+            identifier = int(row[id_field])
+            key = (id_field, identifier)
+            if key in seen:
+                raise ValueError(f"Duplicate {id_field}: {identifier}")
+            seen.add(key)
             document = Document()
             for name in TEXT_WEIGHTS:
                 text = field_text(row, name)
@@ -143,7 +149,7 @@ def build_index(source=SOURCE, output=INDEX):
                     document.add(LongPoint(name, [int(row[name])]))
             document.add(StoredField("record_json", json.dumps(row, ensure_ascii=False)))
             writer.addDocument(document)
-            matched += row.get("wiki_page_id") not in (None, "")
+            matched += has_rhs and has_wiki
             if len(seen) % 25000 == 0:
                 print(f"Indexed {len(seen):,} plants", flush=True)
         if not seen:
@@ -226,7 +232,8 @@ def print_results(result, details=False):
     print(f"\nMatches: {result['total_hits']:,}; search: {result['search_ms']:.3f} ms")
     for rank, hit in enumerate(result["results"], 1):
         row = hit["record"]
-        print(f"\n{rank}. {row['primary_name']} | ID {row['canonical_id']} | BM25 {hit['score']:.6f}")
+        identifier = row.get("canonical_id") or f"wiki:{row['wiki_page_id']}"
+        print(f"\n{rank}. {row['primary_name']} | ID {identifier} | BM25 {hit['score']:.6f}")
         print(row["source_url"])
         if details:
             for key, value in row.items():
@@ -234,7 +241,7 @@ def print_results(result, details=False):
                     print(f"{key}: {value}")
         else:
             print((field_text(row, "description") or field_text(row, "introduction") or "No description")[:300])
-            if row.get("wiki_url"):
+            if row.get("wiki_url") and row["wiki_url"] != row["source_url"]:
                 print(row["wiki_url"])
 
 

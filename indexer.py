@@ -34,6 +34,7 @@ TEXT_FIELDS = {"primary_name", "alternative_names", "description"}
 DESCRIPTION_BONUS = 2
 BM25_K1 = 1.2
 BM25_B = 0.75
+EXPLICIT_CLAUSE = re.compile(r'--(and|or)--([a-z_]+)="([^"\\]*)"(?=\s|$)\s*', re.IGNORECASE)
 
 
 def tokenize(text):
@@ -49,9 +50,8 @@ def parse_query(query, mode="or"):
 
     clauses = []
     position = 0
-    pattern = r'--(and|or)--([a-z_]+)="([^"\\]*)"(?=\s|$)'
     while position < len(query):
-        match = re.match(pattern, query[position:], re.IGNORECASE)
+        match = EXPLICIT_CLAUSE.match(query, position)
         if not match:
             raise ValueError('Use --and--FIELD="words" or --or--FIELD="words". Type help for examples.')
         operator, field, value = match.groups()
@@ -62,34 +62,26 @@ def parse_query(query, mode="or"):
         if not terms:
             raise ValueError(f"The value for {field} must contain at least one word.")
         clauses.append((operator, field, terms))
-        position += match.end()
-        while position < len(query) and query[position].isspace():
-            position += 1
+        position = match.end()
     return clauses
 
 
 def matching_documents(clauses, index, documents):
     candidates = None
     for operator, field, terms in clauses:
-        matching = None
-        for term in terms:
-            found = {entry[0] for entry in index.get(term, [])}
-            if matching is None:
-                matching = found
-            elif operator == "and":
-                matching &= found
-            else:
-                matching |= found
-        matching = matching or set()
+        postings = ({entry[0] for entry in index.get(term, [])} for term in terms)
+        matching = next(postings, set())
+        combine = matching.intersection_update if operator == "and" else matching.update
+        for found in postings:
+            combine(found)
         if candidates is not None:
             matching &= candidates
         if field != "phrase":
             required = set(terms)
+            matches_field = required.issubset if operator == "and" else required.intersection
             matching = {
                 doc_id for doc_id in matching
-                if (required <= set(tokenize(documents[doc_id][field]))
-                    if operator == "and"
-                    else required.intersection(tokenize(documents[doc_id][field])))
+                if matches_field(tokenize(documents[doc_id][field]))
             }
         candidates = matching
         if not candidates:
@@ -110,6 +102,11 @@ def idf(df, total, method):
     return math.log(total / df)
 
 
+def _read_rows(source):
+    with source.open(encoding="utf-8", newline="") as stream:
+        yield from csv.DictReader(stream, delimiter="\t", quoting=csv.QUOTE_NONE)
+
+
 def build_index(source=SOURCE):
     started = perf_counter()
     index = {}
@@ -117,39 +114,35 @@ def build_index(source=SOURCE):
     # First pass: average length of each field for BM25F normalization.
     field_lengths = dict.fromkeys(FIELD_WEIGHTS, 0)
     total = 0
-    with source.open(encoding="utf-8", newline="") as stream:
-        reader = csv.DictReader(stream, delimiter="\t", quoting=csv.QUOTE_NONE)
-        for row in reader:
-            total += 1
-            for field in FIELD_WEIGHTS:
-                tokens = tokenize(row[field])
-                length = len(tokens) if field in TEXT_FIELDS else len(set(tokens))
-                field_lengths[field] += length
+    for row in _read_rows(source):
+        total += 1
+        for field in FIELD_WEIGHTS:
+            tokens = tokenize(row[field])
+            field_lengths[field] += len(tokens) if field in TEXT_FIELDS else len(set(tokens))
     averages = {field: length / total if total else 0
                 for field, length in field_lengths.items()}
 
-    with source.open(encoding="utf-8", newline="") as stream:
-        reader = csv.DictReader(stream, delimiter="\t", quoting=csv.QUOTE_NONE)
-        for row in reader:
-            doc_id = int(row["canonical_id"])
-            term_weights = {}
-            for field, weight in FIELD_WEIGHTS.items():
-                counts = Counter(tokenize(row[field]))
-                length = sum(counts.values()) if field in TEXT_FIELDS else len(counts)
-                norm = 1 - BM25_B + BM25_B * length / averages[field] if averages[field] else 1
-                for term, count in counts.items():
-                    # Repeated words matter in text, but only presence matters
-                    # in categorical fields such as moisture and soil types.
-                    tf = log_tf(count) if field in TEXT_FIELDS else 1
-                    raw_tf = count if field in TEXT_FIELDS else 1
-                    weights = term_weights.setdefault(term, [0, 0])
-                    weights[0] += weight * tf
-                    weights[1] += weight * raw_tf / norm
-            for term, (classic_weight, bm25_tf) in term_weights.items():
-                index.setdefault(term, []).append((doc_id, classic_weight, bm25_tf))
-            documents[doc_id] = row
-            if len(documents) % 10000 == 0:
-                print(f"Plants processed: {len(documents):,}", flush=True)
+    for row in _read_rows(source):
+        doc_id = int(row["canonical_id"])
+        term_weights = {}
+        for field, weight in FIELD_WEIGHTS.items():
+            counts = Counter(tokenize(row[field]))
+            is_text = field in TEXT_FIELDS
+            length = sum(counts.values()) if is_text else len(counts)
+            average = averages[field]
+            norm = 1 - BM25_B + BM25_B * length / average if average else 1
+            for term, count in counts.items():
+                # Count repeated words in text and only presence in other fields.
+                raw_tf = count if is_text else 1
+                tf = log_tf(count) if is_text else 1
+                weights = term_weights.setdefault(term, [0, 0])
+                weights[0] += weight * tf
+                weights[1] += weight * raw_tf / norm
+        for term, (classic_weight, bm25_tf) in term_weights.items():
+            index.setdefault(term, []).append((doc_id, classic_weight, bm25_tf))
+        documents[doc_id] = row
+        if len(documents) % 10000 == 0:
+            print(f"Plants processed: {len(documents):,}", flush=True)
 
     print(f"Documents: {len(documents):,}")
     print(f"With descriptions: {sum(bool(row['description'].strip()) for row in documents.values()):,}")
@@ -292,26 +285,28 @@ def main():
         query = input(f"\nQuery [mode {mode.upper()}, details {'on' if show_details else 'off'}, limit {limit}]: ").strip()
         if not query:
             break
-        if query.casefold() == "help":
+        command = query.casefold()
+        if command == "help":
             print_help()
             continue
-        if query.casefold() in ("details on", "details off"):
-            show_details = query.casefold() == "details on"
+        if command in ("details on", "details off"):
+            show_details = command == "details on"
             console.print(f"Details: {'ON' if show_details else 'OFF'}")
             continue
-        if query.casefold() in ("mode and", "mode or"):
-            mode = query.casefold().split()[1]
+        if command in ("mode and", "mode or"):
+            mode = command.split()[1]
             console.print(f"Mode: {mode.upper()}")
             continue
-        parts = query.casefold().split()
+        parts = command.split()
         if parts[0] == "limit":
             try:
-                if len(parts) != 2 or int(parts[1]) <= 0:
+                new_limit = int(parts[1]) if len(parts) == 2 else 0
+                if new_limit <= 0:
                     raise ValueError
-                limit = int(parts[1])
             except ValueError:
                 console.print("Use 'limit N' with a positive whole number, for example 'limit 20'.")
                 continue
+            limit = new_limit
             console.print(f"Limit: {limit}")
             continue
         try:

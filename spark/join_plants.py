@@ -43,6 +43,10 @@ def merge_fields(joined):
             continue
         if field in SHARED_FIELDS:
             value = sourced_values(field, [("rhs", field), ("wiki", "wiki_" + field)])
+        elif field == "primary_name":
+            value = F.coalesce(field, "wiki_scientific_name", "wiki_article_title")
+        elif field == "source_url":
+            value = F.coalesce(field, "wiki_url")
         else:
             value = F.col(field)
         columns.append(value.alias(field))
@@ -77,8 +81,8 @@ def read_rhs(spark, path):
 def combine(rhs, wiki):
     wiki_fields = WIKI_SCHEMA.fieldNames()
     wiki = wiki.select(*wiki_fields)
-    if wiki.groupBy("page_id").count().filter(F.col("count") > 1).take(1):
-        raise ValueError("Wikipedia page_id must be unique")
+    if wiki.groupBy("page_id").count().filter(F.col("page_id").isNull() | (F.col("count") > 1)).take(1):
+        raise ValueError("Wikipedia page_id must be unique and present")
 
     genera = set()
     for row in wiki.select("genus").distinct().toLocalIterator():
@@ -94,26 +98,14 @@ def combine(rhs, wiki):
         KEY_SCHEMA,
     )
 
-    rhs_names = rhs.select(
-        "canonical_id",
-        F.explode(rhs_keys_udf("primary_name", "alternative_names")).alias("name"),
+    rhs_names = rhs_keys_udf("primary_name", "alternative_names")
+    wiki_names = wiki_keys_udf(
+        "scientific_name", "taxonomic_rank", "scientific_synonyms", "redirect_aliases", "common_names",
     )
-    rhs_keys = rhs_names.select(
-        "canonical_id", F.col("name.key").alias("key"),
-    )
+    rhs_keys = rhs.select("canonical_id", F.explode(rhs_names["key"]).alias("key"))
+    wiki_keys = wiki.select("page_id", F.explode(wiki_names["key"]).alias("key"))
 
-    wiki_names = wiki.select(
-        "page_id",
-        F.explode(wiki_keys_udf(
-            "scientific_name", "taxonomic_rank", "scientific_synonyms",
-            "redirect_aliases", "common_names",
-        )).alias("name"),
-    )
-    wiki_keys = wiki_names.select(
-        "page_id", F.col("name.key").alias("key"),
-    )
-
-    candidates = rhs_keys.join(wiki_keys, "key").distinct()
+    candidates = rhs_keys.join(wiki_keys, "key")
     matches = candidates.groupBy("canonical_id").agg(
         F.sort_array(F.collect_set("page_id")).alias("candidate_page_ids"),
     )
@@ -127,12 +119,13 @@ def combine(rhs, wiki):
     )
 
     result = rhs.join(matches, "canonical_id", "left").fillna({"match_status": "unmatched"})
+    wiki_columns = wiki.select(*[F.col(name).alias("wiki_" + name) for name in wiki_fields])
+    result = result.join(wiki_columns, result.matched_page_id == wiki_columns.wiki_page_id, "full_outer")
+    result = result.fillna({"match_status": "wiki_only"})
     result = result.withColumn(
         "candidate_page_ids", F.coalesce("candidate_page_ids", F.array().cast("array<long>")),
     )
 
-    wiki_columns = wiki.select(*[F.col(name).alias("wiki_" + name) for name in wiki_fields])
-    result = result.join(wiki_columns, result.matched_page_id == wiki_columns.wiki_page_id, "left")
     return result.select(*COLUMNS, "match_status", "candidate_page_ids",
                          *["wiki_" + name for name in wiki_fields])
 
@@ -146,17 +139,22 @@ def join(spark, rhs_path, wiki_path, output):
     result = combine(rhs, wiki).persist(StorageLevel.DISK_ONLY)
 
     rhs_count = rhs.count()
-    if result.count() != rhs_count or result.select("canonical_id").distinct().count() != rhs_count:
-        raise AssertionError("Join changed RHS row count or uniqueness")
-    if rhs.exceptAll(result.select(*COLUMNS)).take(1) or result.select(*COLUMNS).exceptAll(rhs).take(1):
+    rhs_rows = result.filter(F.col("canonical_id").isNotNull()).select(*COLUMNS)
+    if rhs_rows.count() != rhs_count or rhs.exceptAll(rhs_rows).take(1):
         raise AssertionError("Join changed original RHS values")
 
-    statuses = dict.fromkeys(["matched", "unmatched", "ambiguous"], 0)
+    statuses = dict.fromkeys(["matched", "unmatched", "ambiguous", "wiki_only"], 0)
     status_counts = result.groupBy("match_status").count().collect()
     statuses.update({row.match_status: row["count"] for row in status_counts})
     matched_pages = result.filter(F.col("match_status") == "matched").select("wiki_page_id").distinct()
-    report.update(rhs_records=rhs_count, wikipedia_records=wiki.count(), match_counts=statuses,
-                  distinct_wikipedia_pages_joined=matched_pages.count(),
+    wiki_count = wiki.count()
+    matched_page_count = matched_pages.count()
+    if matched_page_count + statuses["wiki_only"] != wiki_count:
+        raise AssertionError("Join changed Wikipedia page coverage")
+    report.update(rhs_records=rhs_count, wikipedia_records=wiki_count, match_counts=statuses,
+                  source_counts={"both": statuses["matched"], "rhs_only": statuses["unmatched"] + statuses["ambiguous"],
+                                 "wiki_only": statuses["wiki_only"]},
+                  output_records=sum(statuses.values()), distinct_wikipedia_pages_joined=matched_page_count,
                   rhs_values_preserved=True)
 
     write_tsv(merge_fields(result), output)

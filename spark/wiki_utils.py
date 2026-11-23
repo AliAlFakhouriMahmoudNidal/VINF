@@ -48,6 +48,10 @@ SECTION_PATTERNS = {
     "uses": r"\buses?\b|human usage|culinary",
     "cultivation": r"cultivation|^growing$",
 }
+TAXOBOX_RANKS = {
+    "genus": "genus", "familia": "family", "ordo": "order",
+    "classis": "class", "divisio": "division", "regnum": "kingdom",
+}
 
 
 def unique(values):
@@ -64,13 +68,14 @@ INNER_TEMPLATE = re.compile(
     r"|\{\{(?!\{)(?:(?!\{\{|\}\}).)*\}\}", re.S,
 )
 PARAMETER_TOKEN = re.compile(r"\{\{|\[\[|\|")
+NAMED_PARAMETER = re.compile(r"\s*([\w ]+)\s*=")
 WIKI_LINK = re.compile(r"\[\[.*?\]\]", re.S)
 
 
 def balanced_end(text, start):
     remaining = text[start:]
     while True:
-        matches = []
+        pieces = []
         covered_until = 0
         for opening in TEMPLATE_OPEN.finditer(remaining):
             if opening.start() < covered_until:
@@ -80,17 +85,14 @@ def balanced_end(text, start):
                 continue
             if match.start() == 0:
                 return start + match.end()
-            matches.append(match)
+            pieces.extend((
+                remaining[covered_until:match.start()],
+                " " * (match.end() - match.start()),
+            ))
             covered_until = match.end()
-        if not matches:
+        if not pieces:
             return None
-        pieces = []
-        position = 0
-        for match in matches:
-            pieces.append(remaining[position:match.start()])
-            pieces.append(" " * (match.end() - match.start()))
-            position = match.end()
-        pieces.append(remaining[position:])
+        pieces.append(remaining[covered_until:])
         remaining = "".join(pieces)
 
 
@@ -118,11 +120,11 @@ def split_parameters(text):
 
 def template_parts(raw):
     parts = split_parameters(raw[2:-2])
-    name = " ".join(parts[0].replace("_", " ").strip().casefold().split())
+    name = " ".join(parts[0].replace("_", " ").casefold().split())
     named = {}
     positional = []
     for part in parts[1:]:
-        match = re.match(r"\s*([\w ]+)\s*=", part)
+        match = NAMED_PARAMETER.match(part)
         if match:
             key = match.group(1).strip().casefold().replace(" ", "_")
             named[key] = part[match.end():].strip()
@@ -246,24 +248,9 @@ def parse_name(text, rank_hint=None, allow_bare_author=False):
 
 
 def rhs_aliases(cell):
-    values = []
-    value = []
-    escaped = False
-    for char in cell or "":
-        if escaped:
-            value.append(char)
-            escaped = False
-        elif char == "\\":
-            escaped = True
-        elif char == "|":
-            values.append("".join(value))
-            value = []
-        else:
-            value.append(char)
-    if escaped:
-        value.append("\\")
-    values.append("".join(value))
-    return [v for v in values if v]
+    # A backslash quotes the next character. Keep a final backslash literally.
+    values = re.findall(r"(?:\\.|[^\\|]|\\\Z)+", cell or "", re.S)
+    return [re.sub(r"\\(.)", r"\1", value, flags=re.S) for value in values]
 
 
 def taxonomy_key(value):
@@ -284,13 +271,14 @@ def parse_taxonomy(title, text, redirect=None):
     _, fields, _ = template_parts(text[start:end])
     active = None
     for part in split_parameters(text[start + 2:end - 2])[1:]:
-        parameter = re.match(r"\s*([\w ]+)\s*=", part)
+        parameter = NAMED_PARAMETER.match(part)
         if parameter:
             active = parameter[1].strip().casefold()
         elif active == "link":
             fields["link"] += "|" + part.strip()
     node = {k: inline(fields.get(k, "")) for k in ["parent", "rank", "link", "same_as"]}
-    node["rank"] = RANK_NAMES.get(node["rank"].casefold(), node["rank"].casefold())
+    rank = node["rank"].casefold()
+    node["rank"] = RANK_NAMES.get(rank, rank)
     return key, node
 
 
@@ -418,8 +406,7 @@ def extract_article(title, text, taxonomy):
     classification = taxonomy_info(parent or candidate_name, taxonomy)
     rank_hint = classification.get("rank")
     if box_kind == "taxobox":
-        for field, rank in [("genus", "genus"), ("familia", "family"), ("ordo", "order"),
-                            ("classis", "class"), ("divisio", "division"), ("regnum", "kingdom")]:
+        for field, rank in TAXOBOX_RANKS.items():
             if inline(fields.get(field, "")).casefold() == candidate_name.casefold():
                 rank_hint = rank
                 break
@@ -431,8 +418,7 @@ def extract_article(title, text, taxonomy):
         return result
 
     if title_fallback:
-        explicit_names = {inline(fields.get(key, "")).casefold() for key in
-                          ["genus", "familia", "ordo", "classis", "divisio", "regnum"]}
+        explicit_names = {inline(fields.get(key, "")).casefold() for key in TAXOBOX_RANKS}
         genus_title = taxonomy_key(NAME_RE.fullmatch(identity["name"])["genus"])
         if (identity["name"].casefold() not in explicit_names
                 and taxonomy_key(candidate_name) not in taxonomy and genus_title not in taxonomy):
